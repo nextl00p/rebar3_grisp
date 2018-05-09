@@ -8,6 +8,7 @@
 -include("rebar3_grisp.hrl").
 
 -import(rebar3_grisp_util, [
+    info/1,
     info/2,
     console/1,
     console/2,
@@ -16,6 +17,8 @@
     sh/1,
     set/3
 ]).
+
+-define(BLOCKSIZE, 4194304). % 4MB
 
 %--- Callbacks -----------------------------------------------------------------
 
@@ -57,7 +60,26 @@ do(State) ->
     OTPVersion = rebar3_grisp_util:get([otp, version], Config,
         ?DEFAULT_OTP_VSN
     ),
-    InstallRoot = rebar3_grisp_util:otp_install_root(State, OTPVersion),
+    Board = rebar3_grisp_util:get([board], Config, ?DEFAULT_GRISP_BOARD),
+
+    case rebar3_grisp_util:toolchain_or_prebuilt(Config) of
+        prebuilt ->
+            info("Trying to obtain prebuilt OTP version"),
+            Apps = rebar3_grisp_util:apps(State),
+            Hash = hash_grisp_files(State, Board, Apps),
+            Version = rebar3_grisp_util:get([otp, version], Config, ?DEFAULT_OTP_VSN),
+            info("Trying to obtain OTP ~p ~p", [Version, Hash]),
+            try obtain_prebuilt(Version, Hash)
+            catch
+                error:nomatch -> abort("We don't have that version of OTP in our download archive. " ++
+                                           "Either you modified some of the C files of the grisp OTP " ++
+                                           "application or you specified a wrong OTP version. " ++
+                                           "Please build your own toolchain.")
+            end,
+            InstallRoot = rebar3_grisp_util:otp_install_root(OTPVersion, Hash, prebuilt);
+        Dir when is_list(Dir) ->
+            InstallRoot = rebar3_grisp_util:otp_install_root(State, OTPVersion, build)
+    end,
     InstallRelVer = rebar3_grisp_util:otp_install_release_version(InstallRoot),
     check_otp_release(InstallRelVer),
     State3 = make_release(State, RelName, RelVsn, InstallRoot),
@@ -65,14 +87,14 @@ do(State) ->
     Dest = get_option(destination, [deploy, destination], State),
     info("Deploying ~s-~s to ~s", [RelName, RelVsn, Dest]),
     run_script(pre_script, State),
-    % FIXME: Resolve ERTS version
+                                                % FIXME: Resolve ERTS version
     ERTSPath = filelib:wildcard(filename:join(InstallRoot, "erts-*")),
     "erts-" ++ ERTSVsn = filename:basename(ERTSPath),
-    Board = rebar3_grisp_util:get([board], Config, ?DEFAULT_GRISP_BOARD),
     copy_files(State3, RelName, RelVsn, Board, ERTSVsn, Dest, Force),
     copy_release(State3, RelName, RelVsn, Dest, Force),
     run_script(post_script, State),
     {ok, State3}.
+
 
 -spec format_error(any()) ->  iolist().
 format_error(Reason) ->
@@ -122,16 +144,7 @@ run_script(Name, State) ->
 
 copy_files(State, RelName, RelVsn, Board, ERTSVsn, Dest, Force) ->
     console("* Copying files..."),
-    AllApps = rebar_state:all_deps(State) ++ rebar_state:project_apps(State),
-    Tree = case rebar3_grisp_util:grisp_app(AllApps) of
-        {[], _} -> grisp_files(rebar_state:dir(State), Board);
-        {[Grisp], _} ->
-            [GrispFiles, ProjectFiles] = lists:map(
-                fun(Dir) -> grisp_files(Dir, Board) end,
-                [rebar_app_info:dir(Grisp), rebar_state:dir(State)]
-            ),
-            maps:merge(GrispFiles, ProjectFiles)
-    end,
+    Tree = build_from_to_tree(State, Board, "files"),
     Context = [
         {release_name, RelName},
         {release_version, RelVsn},
@@ -144,8 +157,8 @@ copy_files(State, RelName, RelVsn, Board, ERTSVsn, Dest, Force) ->
         Tree
     ).
 
-grisp_files(Dir, Board) ->
-    Path = filename:join([Dir, "grisp", Board, "files"]),
+grisp_files(Dir, Board, Subdir) ->
+    Path = filename:join([Dir, "grisp", Board, Subdir]),
     resolve_files(find_files(Path), Path).
 
 write_file(Dest, Target, Source, Force, Context) ->
@@ -168,10 +181,10 @@ resolve_files([File|Files], Root, Resolved) ->
     Relative = prefix(File, Root ++ "/"),
     Name = filename:rootname(Relative, ".mustache"),
     resolve_files(Files, Root, maps:put(
-        Name,
-        resolve_file(Root, Relative, Name, maps:find(Name, Resolved)),
-        Resolved
-    ));
+                                 Name,
+                                 resolve_file(Root, Relative, Name, maps:find(Name, Resolved)),
+                                 Resolved
+                                ));
 resolve_files([], _Root, Resolved) ->
     Resolved.
 
@@ -242,3 +255,143 @@ get_arg_option(Arg, State, Fun) ->
 
 trim(String) ->
     re:replace(String, "(^[\s\n\t]+|[\s\n\t]+$)", "", [global, {return, list}]).
+
+
+obtain_prebuilt(Version, ExpectedHash) ->
+    Tarball = rebar3_grisp_util:otp_cache_file(Version, ExpectedHash),
+    case filelib:is_regular(Tarball) of
+        true ->
+            ETag = get_etag(Tarball),
+            download_and_unpack(Version, ExpectedHash, ETag);
+        false ->
+            download_and_unpack(Version, ExpectedHash, "NULL")
+    end.
+
+get_etag(Tarball) ->
+    case hash_file(Tarball, md5) of
+        {ok, Hash} -> Hash;
+        {error, enoent} -> not_found
+    end.
+
+download_and_unpack(Version, Hash, ETag) ->
+    case file:delete(rebar3_grisp_util:otp_cache_file_temp(Version, Hash)) of
+        ok -> ok;
+        {error, enoent} -> ok;
+        {error, FileReason} -> abort("Error ~p", [FileReason])
+    end,
+    ssl:start(),
+    {ok, InetsPid} = inets:start(httpc, [{profile, rebar3_grisp}], stand_alone),
+    HTTPOptions = rebar_utils:set_httpc_options() ++
+        [{connect_timeout, 5000}],
+    Options = [{stream, rebar3_grisp_util:otp_cache_file_temp(Version, Hash)}, {body_format, binary}],
+    Url = ?DOWNLOAD_CDN_URI ++ rebar3_grisp_util:otp_cache_file_name(Version, Hash),
+    Headers = [{"If-None-Match", ETag}],
+    Response = httpc:request(get, {Url, Headers}, HTTPOptions, Options, InetsPid),
+    case Response of
+        {ok, {{_HTTPVersion, 304, "Not Modified"}, _OtherHeaders}} -> ok;
+        {ok, saved_to_file} -> move_file(rebar3_grisp_util:otp_cache_file_temp(Version, Hash), rebar3_grisp_util:otp_cache_file(Version, Hash));
+        {ok, Other} -> console("Unexpected HTTP reply: ~p, Trying to use cached file~n", [Other]);
+        {error, ResponseReason} -> console("HTTP or Network error. Trying to use local cache: ~p~n", [ResponseReason])
+    end,
+    case file:is_regular(rebar3_grisp_util:otp_cache_file(Version, Hash)) of
+        true -> maybe_unpack(Version, Hash);
+        false -> abort("Could not obtain prebuilt OTP for your configuration. " ++
+                           "This means either you are not connected to the internet, "++
+                           "there is something wrong with our CDN, or you have modified "++
+                           "any of the C drivers. In any case please build your own toolchain" ++
+                           "and OTP (using rebar3 grisp build), or try later")
+    end.
+
+move_file(From, To) ->
+    case file:delete(To) of
+        ok -> ok;
+        {error, enoent} -> ok;
+        {error, Reason} -> abort("Error ~p", [Reason])
+    end,
+    file:rename(From, To),
+    file:delete(From).
+
+maybe_unpack(Version, Hash) ->
+    case should_unpack(Version, Hash) of
+        yes -> tar:extract(rebar3_grisp_util:otp_cache_file(Version, Hash), [{compressed}, {cwd, rebar3_grisp_util:otp_install_root(Version, Hash, prebuilt)}]);
+        no -> ok
+    end.
+
+should_unpack(Version, Hash) ->
+    DirModificationDate = filelib:last_modified(rebar3_grisp_util:otp_install_root(Version, Hash, prebuilt)),
+    FileModificationDate = filelib:last_modified(rebar3_grisp_util:otp_cache_file(Version, Hash)),
+    case {FileModificationDate, DirModificationDate} of
+        {_, 0} -> yes;
+        {X, X} -> no;
+        _Mismatch -> yes
+    end.
+
+hash_grisp_files(State, Board, App) ->
+    %% WRONG!!!:
+    Tree = build_from_to_tree(State, Board, {"sys", "drivers"}),
+    % not needed:
+    Relative = make_relative(maps:to_list(Tree), rebar_app_info:dir(App)),
+    SortedRelative = lists:keysort(1, Relative),
+    FileHashes = lists:map(
+                   fun({Target, Source}) ->
+                           hash_file_map(Target, Source)
+                   end,
+                   SortedRelative
+                  ),
+    HashString = hashes_to_string(FileHashes),
+    %%TODO: write to file
+    crypto:hash(sha256, HashString).
+
+hash_file_map(Target, Source) ->
+    rebar_api:debug("Hashing ~p for location ~p", [Source, Target]),
+    rebar3_grisp_util:hash_file(Source, sha256, Target).
+
+hashes_to_string(Hashes) ->
+    lists:map(
+      fun({Target, Hash}) ->
+              io:format("~s ~s~n", [Target, format_sha256(Hash)]) end,
+      Hashes).
+
+format_sha256(Hash) when is_binary(Hash) ->
+    <<Int:256/big-unsigned-integer>> = Hash,
+    format_sha256(Int);
+format_sha256(Int) when is_integer(Int) ->
+    io:format("~.16B", Int).
+
+hash_file_read(FileHandle, HashHandle) ->
+    case file:read(FileHandle, ?BLOCKSIZE) of
+        {ok, Bin} -> hash_file_read(FileHandle, crypto:hash_update(HashHandle, Bin));
+        eof ->
+            file:close(FileHandle),
+            {ok, crypto:hash_final(HashHandle)}
+    end.
+
+hash_file(File, Algorithm, Name) ->
+    HashHandle = crypto:hash_update(crypto:hash_init(Algorithm), list_to_binary(Name)),
+    case file:open(File, [binary, raw, read]) of
+        {ok, FileHandle} -> hash_file_read(FileHandle, HashHandle);
+        Error -> Error
+    end.
+
+hash_file(File, Algorithm) ->
+    hash_file(File, Algorithm, "").
+
+make_relative(TargetsSources, Root) ->
+    lists:map(fun({Target, Source}) ->
+                      {_Abs, Rel} = lists:split(length(Root), filename:split(Target)),
+                      {Rel, Source}
+              end,
+              TargetsSources).
+
+% Builds a map From => To, project's files replace grisp files,
+build_from_to_tree(State, Board, Subdir) ->
+    AllApps = rebar_state:all_deps(State) ++ rebar_state:project_apps(State),
+    case rebar3_grisp_util:grisp_app(AllApps) of
+        {[], _} -> grisp_files(rebar_state:dir(State), Board, Subdir);
+        {[Grisp], _} ->
+            [GrispFiles, ProjectFiles] = lists:map(
+                                           fun(Dir) -> grisp_files(Dir, Board, Subdir) end,
+                                           [rebar_app_info:dir(Grisp), rebar_state:dir(State)]
+                                          ),
+            maps:merge(GrispFiles, ProjectFiles)
+    end.
