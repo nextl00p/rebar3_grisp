@@ -29,7 +29,7 @@ init(State) ->
             {name, deploy},
             {module, ?MODULE},
             {bare, true},
-            {deps, [{default, app_discovery}]},
+            {deps, [{default, install_deps}]},
             {example, "rebar3 grisp deploy"},
             {opts, [
                 {relname, $n, "relname", string, "Specify the name for the release that will be deployed"},
@@ -281,8 +281,7 @@ download_and_unpack(Version, Hash, ETag) ->
     end,
     ssl:start(),
     {ok, InetsPid} = inets:start(httpc, [{profile, rebar3_grisp}], stand_alone),
-    HTTPOptions = rebar_utils:set_httpc_options() ++
-        [{connect_timeout, 5000}],
+    HTTPOptions = [{connect_timeout, 5000}],
     Options = [{stream, rebar3_grisp_util:otp_cache_file_temp(Version, Hash)}, {body_format, binary}],
     Url = ?DOWNLOAD_CDN_URI ++ rebar3_grisp_util:otp_cache_file_name(Version, Hash),
     Headers = [{"If-None-Match", ETag}],
@@ -290,16 +289,17 @@ download_and_unpack(Version, Hash, ETag) ->
     case Response of
         {ok, {{_HTTPVersion, 304, "Not Modified"}, _OtherHeaders}} -> ok;
         {ok, saved_to_file} -> move_file(rebar3_grisp_util:otp_cache_file_temp(Version, Hash), rebar3_grisp_util:otp_cache_file(Version, Hash));
+        {ok, {{_HTTPVersion, 404, "Not Found"}, _, _}} -> console("Got  HTTP/1.1 404 Not Found. We don't have an archive for you yet");
         {ok, Other} -> console("Unexpected HTTP reply: ~p, Trying to use cached file~n", [Other]);
         {error, ResponseReason} -> console("HTTP or Network error. Trying to use local cache: ~p~n", [ResponseReason])
     end,
-    case file:is_regular(rebar3_grisp_util:otp_cache_file(Version, Hash)) of
+    case filelib:is_regular(rebar3_grisp_util:otp_cache_file(Version, Hash)) of
         true -> maybe_unpack(Version, Hash);
         false -> abort("Could not obtain prebuilt OTP for your configuration. " ++
                            "This means either you are not connected to the internet, "++
                            "there is something wrong with our CDN, or you have modified "++
                            "any of the C drivers. In any case please build your own toolchain" ++
-                           "and OTP (using rebar3 grisp build), or try later")
+                           "and OTP (using rebar3 grisp build), or try later.")
     end.
 
 move_file(From, To) ->
@@ -338,32 +338,29 @@ hash_grisp_files(Apps, Board, OTPRoot, Version) ->
 
     %Relative = make_relative(maps:to_list(ToFrom), rebar_app_info:dir(App)),
 
-    Sorted = lists:keysort(1, ToFrom),
+    Sorted = lists:keysort(1, maps:to_list(ToFrom)),
     FileHashes = lists:map(
                    fun({Target, Source}) ->
-                           hash_file_map(Target, Source)
+                           rebar_api:debug("Hashing ~p for location ~p", [Source, Target]),
+                           hash_file(Source, sha256, Target)
                    end,
                    Sorted
                   ),
     HashString = hashes_to_string(FileHashes),
     %%TODO: write to file
-    crypto:hash(sha256, HashString).
-
-hash_file_map(Target, Source) ->
-    rebar_api:debug("Hashing ~p for location ~p", [Source, Target]),
-    rebar3_grisp_util:hash_file(Source, sha256, Target).
+    lists:flatten(format_sha256(crypto:hash(sha256, HashString))).
 
 hashes_to_string(Hashes) ->
     lists:map(
       fun({Target, Hash}) ->
-              io:format("~s ~s~n", [Target, format_sha256(Hash)]) end,
+              io_lib:format("~s ~s~n", [Target, format_sha256(Hash)]) end,
       Hashes).
 
 format_sha256(Hash) when is_binary(Hash) ->
     <<Int:256/big-unsigned-integer>> = Hash,
     format_sha256(Int);
 format_sha256(Int) when is_integer(Int) ->
-    io:format("~.16B", Int).
+    io_lib:format("~.16B", [Int]).
 
 hash_file_read(FileHandle, HashHandle) ->
     case file:read(FileHandle, ?BLOCKSIZE) of
@@ -374,7 +371,8 @@ hash_file_read(FileHandle, HashHandle) ->
     end.
 
 hash_file(File, Algorithm, Name) ->
-    HashHandle = crypto:hash_update(crypto:hash_init(Algorithm), list_to_binary(Name)),
+    CryptoHandle = crypto:hash_init(Algorithm),
+    HashHandle = crypto:hash_update(CryptoHandle, list_to_binary(Name)),
     case file:open(File, [binary, raw, read]) of
         {ok, FileHandle} -> hash_file_read(FileHandle, HashHandle);
         Error -> Error

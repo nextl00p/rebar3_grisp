@@ -4,7 +4,6 @@
 -export([apps/1]).
 -export([info/1]).
 -export([info/2]).
--export([collect_c_sources/5]).
 -export([console/1]).
 -export([console/2]).
 -export([abort/1]).
@@ -37,10 +36,6 @@ apps(State) ->
 info(Msg) -> info(Msg, []).
 info(Msg, Args) -> rebar_api:info(Msg, Args).
 
-collect_c_sources(App, Board, OTPRoot, Sys, Drivers) ->
-    Source = filename:join([rebar_app_info:dir(App), "grisp", Board]),
-    {maps:merge(Sys, collect_sys(Source, OTPRoot)),  maps:merge(Drivers, collect_drivers(Source, OTPRoot))}.
-
 console(Msg) -> console(Msg, []).
 console(Msg, Args) -> rebar_api:console(Msg, Args).
 
@@ -61,13 +56,11 @@ get(Keys, Term, Default) when is_list(Keys) ->
 get(Key, Term, Default) ->
     get([Key], Term, Default).
 
-
-                                                % TODO: Seperate map creation from copying and patching. Move it to rebar3_grisp_util, use it for hashing.
-                                                % Add functionality to create archive, add switch to rebar3 grisp build
 get_copy_list(Apps, Board, OTPRoot, Version) ->
+    rebar_api:debug("Creating copy list for apps: ~p", [Apps]),
     {_SystemFiles, _DriverFiles} = lists:foldl(
                                      fun(A, {Sys, Drivers}) ->
-                                             rebar3_grisp_util:collect_c_sources(A, Board, OTPRoot, Sys, Drivers)
+                                             collect_c_sources(A, Board, OTPRoot, Sys, Drivers)
                                      end,
                                      {#{}, #{}},
                                      Apps
@@ -135,6 +128,10 @@ toolchain_or_prebuilt(Config) ->
 
 %--- Internal ------------------------------------------------------------------
 
+collect_c_sources(App, Board, OTPRoot, Sys, Drivers) ->
+    Source = filename:join([rebar_app_info:dir(App), "grisp", Board]),
+    {maps:merge(Sys, collect_sys(Source, OTPRoot)),  maps:merge(Drivers, collect_drivers(Source, OTPRoot))}.
+
 collect_sys(Source, OTPRoot) ->
     maps:merge(
       collect_files(
@@ -160,6 +157,7 @@ collect_drivers(Source, OTPRoot) ->
      ).
 
 collect_files({SourceRoot, Pattern}, Target) ->
+    rebar_api:debug("Collecting ~p ~p for Target ~p", [SourceRoot, Pattern, Target]),
     Files = filelib:wildcard(filename:join(SourceRoot, Pattern)),
     maps:from_list([collect_file(F, Target) || F <- Files]).
 
@@ -167,6 +165,7 @@ collect_file(Source, {TargetRoot, TargetDir}) ->
     Base = filename:basename(Source),
     TargetFile = filename:join(TargetDir, Base),
     Target = filename:join(TargetRoot, TargetFile),
+    rebar_api:debug("Collecting Target ~p, Source ~p", [Target, Source]),
     {Target, Source}.
 
 deep_get([], Value, _Default) ->
