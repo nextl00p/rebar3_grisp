@@ -61,13 +61,13 @@ do(State) ->
         ?DEFAULT_OTP_VSN
     ),
     Board = rebar3_grisp_util:get([board], Config, ?DEFAULT_GRISP_BOARD),
+    Version = rebar3_grisp_util:get([otp, version], Config, ?DEFAULT_OTP_VSN),
 
     case rebar3_grisp_util:toolchain_or_prebuilt(Config) of
         prebuilt ->
             info("Trying to obtain prebuilt OTP version"),
             Apps = rebar3_grisp_util:apps(State),
-            Hash = hash_grisp_files(State, Board, Apps),
-            Version = rebar3_grisp_util:get([otp, version], Config, ?DEFAULT_OTP_VSN),
+            Hash = hash_grisp_files(Apps, Board, "", Version),
             info("Trying to obtain OTP ~p ~p", [Version, Hash]),
             try obtain_prebuilt(Version, Hash)
             catch
@@ -326,17 +326,24 @@ should_unpack(Version, Hash) ->
         _Mismatch -> yes
     end.
 
-hash_grisp_files(State, Board, App) ->
-    %% WRONG!!!:
-    Tree = build_from_to_tree(State, Board, {"sys", "drivers"}),
-    % not needed:
-    Relative = make_relative(maps:to_list(Tree), rebar_app_info:dir(App)),
-    SortedRelative = lists:keysort(1, Relative),
+hash_grisp_files(Apps, Board, OTPRoot, Version) ->
+    {SystemFiles, DriverFiles} = rebar3_grisp_util:get_copy_list(Apps, Board, OTPRoot, Version),
+    ToFrom = maps:merge(SystemFiles, DriverFiles),
+    rebar_api:debug("Hashing ToFrom map: ~p", [ToFrom]),
+
+%% WRONG!!!:
+    %Tree = build_from_to_tree(State, Board, {"sys", "drivers"}),
+
+                                                % not needed:
+
+    %Relative = make_relative(maps:to_list(ToFrom), rebar_app_info:dir(App)),
+
+    Sorted = lists:keysort(1, ToFrom),
     FileHashes = lists:map(
                    fun({Target, Source}) ->
                            hash_file_map(Target, Source)
                    end,
-                   SortedRelative
+                   Sorted
                   ),
     HashString = hashes_to_string(FileHashes),
     %%TODO: write to file

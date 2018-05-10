@@ -65,7 +65,16 @@ do(State) ->
             ensure_clone(URL, BuildRoot, Version, Opts),
 
             info("Preparing GRiSP code"),
-            copy_code(Apps, Board, BuildRoot, Version),
+            {SystemFiles, DriverFiles} = rebar3_grisp_util:get_copy_list(Apps, Board, BuildRoot, Version),
+            console("* Copying C code..."),
+            maps:map(
+              fun(Target, Source) ->
+                      rebar_api:debug("GRiSP - Copy ~p -> ~p", [Source, Target]),
+                      {ok, _} = file:copy(Source, Target)
+              end,
+              maps:merge(SystemFiles, DriverFiles)
+             ),
+            patch_otp(BuildRoot, maps:keys(DriverFiles), Version),
 
             info("Building"),
             ErlXComp = "erl-xcomp-" ++ Version ++ ".conf",
@@ -147,78 +156,6 @@ config_file(Apps, Board, PathParts, DefaultConf) ->
     end,
     lists:foldl(FoldFun, DefaultConf, lists:reverse(Apps)).
 
-copy_code(Apps, Board, OTPRoot, Version) ->
-    console("* Copying C code..."),
-    {SystemFiles, DriverFiles} = lists:foldl(
-                fun(A, {Sys, Drivers}) ->
-                        collect_c_sources(A, Board, OTPRoot, Sys, Drivers)
-                end,
-                {#{}, #{}},
-                Apps
-               ),
-    maps:map(
-      fun(Target, Source) ->
-              {ok, _} = file:copy(Source, Target)
-      end,
-      maps:merge(SystemFiles, DriverFiles)
-     ),
-    patch_otp(OTPRoot, maps:keys(DriverFiles), Version).
-
-%% copy_code(Apps, Board, OTPRoot, Version) ->
-%%     console("* Copying C code..."),
-%%     Drivers = lists:foldl(
-%%         fun(A, D) ->
-%%             copy_app_code(A, Board, OTPRoot, D)
-%%         end,
-%%         [],
-%%          Apps
-%%     ),
-%%     patch_otp(OTPRoot, Drivers, Version).
-
-collect_c_sources(App, Board, OTPRoot, Sys, Drivers) ->
-    Source = filename:join([rebar_app_info:dir(App), "grisp", Board]),
-    {maps:merge(Sys, collect_sys(Source, OTPRoot)),  maps:merge(Drivers, collect_drivers(Source, OTPRoot))}.
-
-%% copy_app_code(App, Board, OTPRoot, Drivers) ->
-%%     Source = filename:join([rebar_app_info:dir(App), "grisp", Board]),
-%%     copy_sys(Source, OTPRoot),
-%%     Drivers ++ copy_drivers(Source, OTPRoot).
-
-collect_sys(Source, OTPRoot) ->
-    maps:merge(
-      collect_files(
-        {Source, "sys/*.h"},
-        {OTPRoot, "erts/emulator/sys/unix"}
-       ),
-      collect_files(
-        {Source, "sys/*.c"},
-        {OTPRoot, "erts/emulator/sys/unix"}
-       )
-     ).
-
-collect_drivers(Source, OTPRoot) ->
-    maps:merge(
-      collect_files(
-        {Source, "drivers/*.h"},
-        {OTPRoot, "erts/emulator/drivers/unix"}
-       ),
-      collect_files(
-        {Source, "drivers/*.c"},
-        {OTPRoot, "erts/emulator/drivers/unix"}
-       )
-     ).
-
-collect_files({SourceRoot, Pattern}, Target) ->
-    Files = filelib:wildcard(filename:join(SourceRoot, Pattern)),
-    maps:from_list([collect_file(F, Target) || F <- Files]).
-
-collect_file(Source, {TargetRoot, TargetDir}) ->
-    Base = filename:basename(Source),
-    TargetFile = filename:join(TargetDir, Base),
-    Target = filename:join(TargetRoot, TargetFile),
-    rebar_api:debug("GRiSP - Copy ~p -> ~p", [Source, Target]),
-    {ok, _} = file:copy(Source, Target),
-    {Target, Source}.
 
 patch_otp(OTPRoot, Drivers, Version) ->
     rebar_api:debug("Patching OTP Version ~p", [Version]),

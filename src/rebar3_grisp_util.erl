@@ -13,6 +13,7 @@
 -export([sh/2]).
 -export([get/2]).
 -export([get/3]).
+-export([get_copy_list/4]).
 -export([set/3]).
 -export([root/1]).
 -export([otp_build_root/2]).
@@ -59,6 +60,18 @@ get(Keys, Term, Default) when is_list(Keys) ->
     deep_get(Keys, Term, fun() -> Default end);
 get(Key, Term, Default) ->
     get([Key], Term, Default).
+
+
+                                                % TODO: Seperate map creation from copying and patching. Move it to rebar3_grisp_util, use it for hashing.
+                                                % Add functionality to create archive, add switch to rebar3 grisp build
+get_copy_list(Apps, Board, OTPRoot, Version) ->
+    {_SystemFiles, _DriverFiles} = lists:foldl(
+                                     fun(A, {Sys, Drivers}) ->
+                                             rebar3_grisp_util:collect_c_sources(A, Board, OTPRoot, Sys, Drivers)
+                                     end,
+                                     {#{}, #{}},
+                                     Apps
+                                    ).
 
 set(Keys, Struct, Value) ->
     update(Keys, Struct, fun
@@ -154,8 +167,6 @@ collect_file(Source, {TargetRoot, TargetDir}) ->
     Base = filename:basename(Source),
     TargetFile = filename:join(TargetDir, Base),
     Target = filename:join(TargetRoot, TargetFile),
-    rebar_api:debug("GRiSP - Copy ~p -> ~p", [Source, Target]),
-    {ok, _} = file:copy(Source, Target),
     {Target, Source}.
 
 deep_get([], Value, _Default) ->
