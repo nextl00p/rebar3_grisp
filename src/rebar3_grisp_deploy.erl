@@ -18,8 +18,6 @@
     set/3
 ]).
 
--define(BLOCKSIZE, 4194304). % 4MB
-
 %--- Callbacks -----------------------------------------------------------------
 
 -spec init(rebar_state:t()) -> {ok, rebar_state:t()}.
@@ -67,7 +65,11 @@ do(State) ->
         prebuilt ->
             info("Trying to obtain prebuilt OTP version"),
             Apps = rebar3_grisp_util:apps(State),
-            Hash = hash_grisp_files(Apps, Board, "", Version),
+
+            {SystemFiles, DriverFiles} = rebar3_grisp_util:get_copy_list(Apps, Board, ""),
+            ToFrom = maps:merge(SystemFiles, DriverFiles),
+            {Hash, _} = rebar3_grisp_util:hash_grisp_files(ToFrom),
+
             info("Trying to obtain OTP ~p ~p", [Version, Hash]),
             try obtain_prebuilt(Version, Hash)
             catch
@@ -144,7 +146,7 @@ run_script(Name, State) ->
 
 copy_files(State, RelName, RelVsn, Board, ERTSVsn, Dest, Force) ->
     console("* Copying files..."),
-    Tree = build_from_to_tree(State, Board, "files"),
+    Tree = build_from_to_tree(State, Board, ""),
     Context = [
         {release_name, RelName},
         {release_version, RelVsn},
@@ -262,18 +264,20 @@ obtain_prebuilt(Version, ExpectedHash) ->
     case filelib:is_regular(Tarball) of
         true ->
             ETag = get_etag(Tarball),
+            rebar_api:debug("Found file with ETag ~p", [ETag]),
             download_and_unpack(Version, ExpectedHash, ETag);
         false ->
             download_and_unpack(Version, ExpectedHash, "NULL")
     end.
 
 get_etag(Tarball) ->
-    case hash_file(Tarball, md5) of
-        {ok, Hash} -> Hash;
+    case rebar3_grisp_util:hash_file(Tarball, md5) of
+        {ok, Hash} -> string:to_lower(lists:flatten(rebar3_grisp_util:format_hash(md5, Hash)));
         {error, enoent} -> not_found
     end.
 
 download_and_unpack(Version, Hash, ETag) ->
+    filelib:ensure_dir(rebar3_grisp_util:otp_cache_file(Version, Hash)),
     case file:delete(rebar3_grisp_util:otp_cache_file_temp(Version, Hash)) of
         ok -> ok;
         {error, enoent} -> ok;
@@ -286,15 +290,22 @@ download_and_unpack(Version, Hash, ETag) ->
     Url = ?DOWNLOAD_CDN_URI ++ rebar3_grisp_util:otp_cache_file_name(Version, Hash),
     Headers = [{"If-None-Match", ETag}],
     Response = httpc:request(get, {Url, Headers}, HTTPOptions, Options, InetsPid),
+    rebar_api:debug("Trying to download to ~p", [rebar3_grisp_util:otp_cache_file_temp(Version, Hash)]),
     case Response of
-        {ok, {{_HTTPVersion, 304, "Not Modified"}, _OtherHeaders}} -> ok;
-        {ok, saved_to_file} -> move_file(rebar3_grisp_util:otp_cache_file_temp(Version, Hash), rebar3_grisp_util:otp_cache_file(Version, Hash));
-        {ok, {{_HTTPVersion, 404, "Not Found"}, _, _}} -> console("Got  HTTP/1.1 404 Not Found. We don't have an archive for you yet");
-        {ok, Other} -> console("Unexpected HTTP reply: ~p, Trying to use cached file~n", [Other]);
-        {error, ResponseReason} -> console("HTTP or Network error. Trying to use local cache: ~p~n", [ResponseReason])
+        {ok, {{_HTTPVersion, 304, "Not Modified"}, _OtherHeaders, _Body}} ->
+            console("File not modified on server");
+        {ok, saved_to_file} ->
+            move_file(rebar3_grisp_util:otp_cache_file_temp(Version, Hash),
+                      rebar3_grisp_util:otp_cache_file(Version, Hash));
+        {ok, {{_HTTPVersion, 404, "Not Found"}, _, _}} ->
+            console("Got  HTTP/1.1 404 Not Found. We don't have an archive for you yet");
+        {ok, Other} ->
+            console("Unexpected HTTP reply: ~p, Trying to use cached file~n", [Other]);
+        {error, ResponseReason} ->
+            console("HTTP or Network error. Trying to use local cache: ~p~n", [ResponseReason])
     end,
     case filelib:is_regular(rebar3_grisp_util:otp_cache_file(Version, Hash)) of
-        true -> maybe_unpack(Version, Hash);
+        true -> maybe_unpack(Version, Hash, ETag);
         false -> abort("Could not obtain prebuilt OTP for your configuration. " ++
                            "This means either you are not connected to the internet, "++
                            "there is something wrong with our CDN, or you have modified "++
@@ -311,82 +322,28 @@ move_file(From, To) ->
     file:rename(From, To),
     file:delete(From).
 
-maybe_unpack(Version, Hash) ->
-    case should_unpack(Version, Hash) of
-        yes -> tar:extract(rebar3_grisp_util:otp_cache_file(Version, Hash), [{compressed}, {cwd, rebar3_grisp_util:otp_install_root(Version, Hash, prebuilt)}]);
-        no -> ok
+maybe_unpack(Version, Hash, ETag) ->
+    case should_unpack(Version, Hash, ETag) of
+        yes ->
+            console("Extracting ~p to ~p", [rebar3_grisp_util:otp_cache_file(Version, Hash), rebar3_grisp_util:otp_install_root(Version, Hash, prebuilt)]),
+            case erl_tar:extract(
+                   rebar3_grisp_util:otp_cache_file(Version, Hash),
+                   [compressed, {cwd, rebar3_grisp_util:otp_install_root(Version, Hash, prebuilt)}])
+            of
+                ok -> ok;
+                {error, Reason} -> abort("Tar extraction failed: ~p", [Reason])
+            end,
+            ok = file:write_file(filename:join([rebar3_grisp_util:otp_install_root(Version, Hash, prebuilt), "ETag"]),
+                            list_to_binary("{etag, \"" ++ ETag ++ "\"}."));
+        no -> console("Extracted archive not modified")
     end.
 
-should_unpack(Version, Hash) ->
-    DirModificationDate = filelib:last_modified(rebar3_grisp_util:otp_install_root(Version, Hash, prebuilt)),
-    FileModificationDate = filelib:last_modified(rebar3_grisp_util:otp_cache_file(Version, Hash)),
-    case {FileModificationDate, DirModificationDate} of
-        {_, 0} -> yes;
-        {X, X} -> no;
-        _Mismatch -> yes
+should_unpack(Version, Hash, ETag) ->
+    case file:consult(filename:join([rebar3_grisp_util:otp_install_root(Version, Hash, prebuilt), "ETag"])) of
+        {ok, [{etag, ETag}]} -> no; % not modified
+        {error, enoent} -> yes;
+        _Other  -> yes
     end.
-
-hash_grisp_files(Apps, Board, OTPRoot, Version) ->
-    {SystemFiles, DriverFiles} = rebar3_grisp_util:get_copy_list(Apps, Board, OTPRoot, Version),
-    ToFrom = maps:merge(SystemFiles, DriverFiles),
-    rebar_api:debug("Hashing ToFrom map: ~p", [ToFrom]),
-
-%% WRONG!!!:
-    %Tree = build_from_to_tree(State, Board, {"sys", "drivers"}),
-
-                                                % not needed:
-
-    %Relative = make_relative(maps:to_list(ToFrom), rebar_app_info:dir(App)),
-
-    Sorted = lists:keysort(1, maps:to_list(ToFrom)),
-    FileHashes = lists:map(
-                   fun({Target, Source}) ->
-                           rebar_api:debug("Hashing ~p for location ~p", [Source, Target]),
-                           hash_file(Source, sha256, Target)
-                   end,
-                   Sorted
-                  ),
-    HashString = hashes_to_string(FileHashes),
-    %%TODO: write to file
-    lists:flatten(format_sha256(crypto:hash(sha256, HashString))).
-
-hashes_to_string(Hashes) ->
-    lists:map(
-      fun({Target, Hash}) ->
-              io_lib:format("~s ~s~n", [Target, format_sha256(Hash)]) end,
-      Hashes).
-
-format_sha256(Hash) when is_binary(Hash) ->
-    <<Int:256/big-unsigned-integer>> = Hash,
-    format_sha256(Int);
-format_sha256(Int) when is_integer(Int) ->
-    io_lib:format("~.16B", [Int]).
-
-hash_file_read(FileHandle, HashHandle) ->
-    case file:read(FileHandle, ?BLOCKSIZE) of
-        {ok, Bin} -> hash_file_read(FileHandle, crypto:hash_update(HashHandle, Bin));
-        eof ->
-            file:close(FileHandle),
-            {ok, crypto:hash_final(HashHandle)}
-    end.
-
-hash_file(File, Algorithm, Name) ->
-    CryptoHandle = crypto:hash_init(Algorithm),
-    HashHandle = crypto:hash_update(CryptoHandle, list_to_binary(Name)),
-    case file:open(File, [binary, raw, read]) of
-        {ok, FileHandle} -> hash_file_read(FileHandle, HashHandle);
-        Error -> Error
-    end.
-
-hash_file(File, Algorithm) ->
-    hash_file(File, Algorithm, "").
-
-make_relative(TargetsSources, Root) ->
-    lists:map(fun({Target, Source}) ->
-                      {_Abs, Rel} = lists:split(length(Root), filename:split(Target)),
-                      {Rel, Source}
-              end,
-              TargetsSources).
 
 % Builds a map From => To, project's files replace grisp files,
 build_from_to_tree(State, Board, Subdir) ->
@@ -398,5 +355,6 @@ build_from_to_tree(State, Board, Subdir) ->
                                            fun(Dir) -> grisp_files(Dir, Board, Subdir) end,
                                            [rebar_app_info:dir(Grisp), rebar_state:dir(State)]
                                           ),
-            maps:merge(GrispFiles, ProjectFiles)
+            maps:merge(GrispFiles, ProjectFiles);
+        {Newe, Strowo} -> abort("NEWE ~p ~n ~n Strowo ~p", [ Newe, Strowo])
     end.

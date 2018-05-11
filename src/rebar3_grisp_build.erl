@@ -29,6 +29,9 @@ init(State) ->
                 },
                 {configure, $g, "configure", {boolean, true},
                     "Run autoconf & configure"
+                },
+                {tar, $t, "tar", {boolean, false},
+                    "Create tarball with OTP installation for online repository"
                 }
             ]},
             {profiles, [default]},
@@ -65,14 +68,15 @@ do(State) ->
             ensure_clone(URL, BuildRoot, Version, Opts),
 
             info("Preparing GRiSP code"),
-            {SystemFiles, DriverFiles} = rebar3_grisp_util:get_copy_list(Apps, Board, BuildRoot, Version),
+            {SystemFiles, DriverFiles} = rebar3_grisp_util:get_copy_list(Apps, Board, BuildRoot),
+            ToFrom = maps:merge(SystemFiles, DriverFiles),
             console("* Copying C code..."),
             maps:map(
               fun(Target, Source) ->
                       rebar_api:debug("GRiSP - Copy ~p -> ~p", [Source, Target]),
                       {ok, _} = file:copy(Source, Target)
               end,
-              maps:merge(SystemFiles, DriverFiles)
+              ToFrom
              ),
             patch_otp(BuildRoot, maps:keys(DriverFiles), Version),
 
@@ -82,7 +86,30 @@ do(State) ->
             BuildConfFile = config_file(Apps, Board, ["grisp.conf"]),
             BuildConfig = rebar3_grisp_util:merge_config(Config, BuildConfFile),
             build(BuildConfig, ErlXCompPath, BuildRoot, InstallRoot, Opts, TcRoot),
-            % TODO: When archive flag is given create .tar.gz archive!
+
+            info("Computing file hashes"),
+            % we need relative filenames, so we cannot reuse from above
+            {SystemFiles2, DriverFiles2} = rebar3_grisp_util:get_copy_list(Apps, Board, ""),
+            ToFrom2 = maps:merge(SystemFiles2, DriverFiles2),
+            {Hash, HashString} = rebar3_grisp_util:hash_grisp_files(ToFrom2),
+            info("Writing hashes to file. Hash: ~p", [Hash]),
+            file:write_file(filename:join(["InstallRoot", "filehashes_" ++ HashString]),
+                            list_to_binary(HashString)),
+            case rebar3_grisp_util:get(tar, Opts, false) of
+                true ->
+                    GrispFolder = rebar3_grisp_util:root(State),
+                    Tarball = filename:join([GrispFolder, rebar3_grisp_util:otp_cache_file_name(Version, Hash)]),
+                    info("Creating tar archive ~p", [Tarball]),
+                    sh("tar -zcf " ++
+                           Tarball ++
+                           %% " --exclude " ++ filename:join([InstallRoot, "erts-*", "{include, lib, src, man, doc}"]) ++
+                           %% " --exclude " ++ filename:join([InstallRoot, "usr", "*"]) ++
+                           %% " --exclude " ++ filename:join([InstallRoot, "bin", "{erl, start_erl, start, epmd"]) ++
+                           %% " --exclude " ++ filename:join([InstallRoot, "lib", "*", "{src, c_src, examples}"]) ++
+                           "  .", [{cd, InstallRoot}]);
+                false -> ok
+            end,
+
             info("Done"),
             {ok, State}
     end.

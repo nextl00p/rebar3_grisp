@@ -10,9 +10,12 @@
 -export([abort/2]).
 -export([sh/1]).
 -export([sh/2]).
+-export([format_hash/1, format_hash/2]).
 -export([get/2]).
 -export([get/3]).
--export([get_copy_list/4]).
+-export([get_copy_list/3]).
+-export([hash_grisp_files/1]).
+-export([hash_file/2, hash_file/3]).
 -export([set/3]).
 -export([root/1]).
 -export([otp_build_root/2]).
@@ -25,6 +28,8 @@
 -export([grisp_app/1]).
 -export([merge_config/2]).
 -export([toolchain_or_prebuilt/1]).
+
+-define(BLOCKSIZE, 4194304). % 4MB
 
 %--- API -----------------------------------------------------------------------
 
@@ -46,6 +51,16 @@ sh(Command) -> sh(Command, []).
 sh(Command, Args) ->
     rebar_utils:sh(Command, Args ++ [abort_on_error]).
 
+format_hash(sha256, Hash) when is_binary(Hash) ->
+    <<Int:256/big-unsigned-integer>> = Hash,
+    format_hash(Int);
+format_hash(md5, Hash) when is_binary(Hash) ->
+    <<Int:128/big-unsigned-integer>> = Hash,
+    format_hash(Int).
+
+format_hash(Int) when is_integer(Int) ->
+    io_lib:format("~.16B", [Int]).
+
 get(Keys, Term) when is_list(Keys) ->
     deep_get(Keys, Term, fun() -> error({key_not_found, Keys, Term}) end);
 get(Key, Term) ->
@@ -56,7 +71,7 @@ get(Keys, Term, Default) when is_list(Keys) ->
 get(Key, Term, Default) ->
     get([Key], Term, Default).
 
-get_copy_list(Apps, Board, OTPRoot, Version) ->
+get_copy_list(Apps, Board, OTPRoot) ->
     rebar_api:debug("Creating copy list for apps: ~p", [Apps]),
     {_SystemFiles, _DriverFiles} = lists:foldl(
                                      fun(A, {Sys, Drivers}) ->
@@ -65,6 +80,33 @@ get_copy_list(Apps, Board, OTPRoot, Version) ->
                                      {#{}, #{}},
                                      Apps
                                     ).
+
+hash_grisp_files(ToFrom) ->
+    rebar_api:debug("Hashing ToFrom map: ~p", [ToFrom]),
+
+    Sorted = lists:keysort(1, maps:to_list(ToFrom)),
+    FileHashes = lists:map(
+                   fun({Target, Source}) ->
+                           rebar_api:debug("Hashing ~p for location ~p", [Source, Target]),
+                           hash_file(Source, sha256, Target)
+                   end,
+                   Sorted
+                  ),
+    HashString = hashes_to_string(FileHashes),
+    %%TODO: write to file
+    Hash = lists:flatten(format_hash(sha256, crypto:hash(sha256, HashString))),
+    {Hash, HashString}.
+
+hash_file(File, Algorithm, Name) ->
+    CryptoHandle = crypto:hash_init(Algorithm),
+    HashHandle = crypto:hash_update(CryptoHandle, list_to_binary(Name)),
+    case file:open(File, [binary, raw, read]) of
+        {ok, FileHandle} -> hash_file_read(FileHandle, HashHandle);
+        Error -> Error
+    end.
+
+hash_file(File, Algorithm) ->
+    hash_file(File, Algorithm, "").
 
 set(Keys, Struct, Value) ->
     update(Keys, Struct, fun
@@ -105,9 +147,10 @@ otp_cache_file_temp(Version, Hash) ->
     otp_cache_file(Version, Hash) ++ ".temp".
 
 grisp_app(Apps) ->
+    UApps = lists:usort(Apps),
     lists:partition(
         fun(A) -> rebar_app_info:name(A) == <<"grisp">> end,
-        Apps
+        UApps
     ).
 
 merge_config(New, Old) ->
@@ -194,6 +237,20 @@ deep_update([Key|Keys], Struct, Fun) when is_map(Struct) ->
     end;
 deep_update([], Struct, Fun) ->
     Fun([], Struct).
+
+hashes_to_string(Hashes) ->
+    lists:map(
+      fun({Target, Hash}) ->
+              io_lib:format("~s ~s~n", [Target, format_hash(sha256, Hash)]) end,
+      Hashes).
+
+hash_file_read(FileHandle, HashHandle) ->
+    case file:read(FileHandle, ?BLOCKSIZE) of
+        {ok, Bin} -> hash_file_read(FileHandle, crypto:hash_update(HashHandle, Bin));
+        eof ->
+            file:close(FileHandle),
+            {ok, crypto:hash_final(HashHandle)}
+    end.
 
 merge_config_([], Acc) -> lists:reverse(Acc);
 merge_config_([{Key, []}, {Key, [{_, _}|_] = Val} | Rest], Acc) ->
